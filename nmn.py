@@ -793,7 +793,10 @@ class Song:
                 line_output.append(r"\end{tikzpicture}")
                 line_output.append("")
                 assert line_output[0] == r"\begin{tikzpicture}" and pos > 0
-                line_output[0] = line_output[0] + "[xscale={}]".format(110 / pos)
+                xscale = 120 / pos
+                if xscale < 0.77:
+                    xscale = 125 / pos
+                line_output[0] = line_output[0] + "[xscale={}]".format(xscale)
 
                 line_file = line_file_format.format(chr(ord('a') + i), j)
                 with open(line_file, "w") as f:

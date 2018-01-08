@@ -3,10 +3,12 @@ import os
 import re
 from fractions import Fraction
 from enum import Enum
-from collections import namedtuple
+from collections import namedtuple, OrderedDict
 
 
-Time = namedtuple('Time', ['upper', 'lower', 'hyphen'])
+Time = namedtuple('Time', ['upper', 'lower', 'hyphen', 'duration'])
+Bar = namedtuple('Bar', ['time', 'start_beat', 'notes'])
+Section = namedtuple('Section', ['name', 'lines'])
 
 
 class Note:
@@ -211,8 +213,9 @@ class Note:
     def __repr__(self):
         acc_str = {-1: 'b', 0: '%', 1: '#', None: ' '}
         oct_str = {-2: ',,', -1: ',', 0: '', 1: "'", 2: '"'}
-        return '{}{}{:2} {:4}'.format(
-                acc_str[self.acc], self.name, oct_str[self.octave], str(self.duration), self.tie)
+        return '{}{}{:2} {:4} {:d}{:d}'.format(acc_str[self.acc], self.name,
+                                               oct_str[self.octave], str(self.duration),
+                                               self.tie[0], self.tie[1])
 
 
 class NodeType(Enum):
@@ -353,63 +356,58 @@ class Song:
         for tag, lyrics in self.lyrics:
             print('<{}> {}'.format(tag, lyrics))
 
-    def append_time_signature(self, time, s):
-        """Append bars to self.melody.
+    @classmethod
+    def parse_melody(cls, key, time, start_beat, melody_str, auto_split=False):
+        """Parse ``s`` to obtain a list of bars.
 
         Split s into bars by '|'.
         If the duration of a bar exceeds time, split it further based on whether it is the first bar.
         """
-        if not time:
-            raise ValueError('unknown <time>')
-        if not s:
-            return
-
         pattern_pitch = r"[#$%]?[0-7a-zA-Z][',]*"
         pattern_pitches = r'\[(?:{})+\]'.format(pattern_pitch)
         pattern_duration = r'(?:[_=]+|-*)\.*(?:/3)?'
         pattern = '(~?)' + '({}|{})({})'.format(pattern_pitch, pattern_pitches, pattern_duration) + '(~?)'
 
-        bars = s.split('|')
-        for i, bar in enumerate(bars):
-            if not bar:
+        bars = []
+
+        bar_strs = melody_str.split('|')
+        for i, bar_str in enumerate(bar_strs):
+            if not bar_str:
                 continue
 
             bar_duration = Fraction(0)
             note_list = []
 
             # parse notes in bar
-            notes = re.findall(pattern, bar)
-            if ''.join([''.join(note) for note in notes]) != bar:
-                raise ValueError('wrong format for {} (notes = {})'.format(bar, notes))
-            for tie0, pitches, duration, tie1 in notes:
+            notes = re.findall(pattern, bar_str)
+            if ''.join([''.join(note) for note in notes]) != bar_str:
+                raise ValueError('wrong format for {} (notes = {})'.format(bar_str, notes))
+            for note in notes:
+                tie0, pitches, duration, tie1 = note
                 tie0, tie1 = (tie0 != ''), (tie1 != '')
                 dots = duration.count('.')
                 dashes = duration.count('-')
                 underlines = duration.count('=') * 2 + duration.count('_')
                 if dashes > 0 and underlines > 0:
-                    raise ValueError('wrong format for {}'.format(notes))
+                    raise ValueError('wrong format for note {!r}'.format(note))
                 triplet = Fraction(1)
                 if '/3' in duration:
                     triplet = Fraction(2, 3)
-                if time.lower:
-                    if pitches.startswith('[') and pitches.endswith(']'):
-                        duration = (Fraction(dashes + 1, 1 << underlines)
-                                    * (Fraction(2) - Fraction(1, 1 << dots)) * triplet)
-                    else:
+                duration = (Fraction(dashes + 1, 1 << underlines)
+                            * (Fraction(2) - Fraction(1, 1 << dots)) * triplet)
+                if time.hyphen != 4:
+                    if not (pitches.startswith('[') and pitches.endswith(']')):
                         if dots or underlines or (triplet != 1):
                             raise ValueError('dots, underlines and triplets are not allowed'
                                              ' without brackets in <time> {}/{} hyphen={}'
-                                             .format(*time))
+                                             .format(time.upper, time.lower, time.hyphen))
                         duration = Fraction(dashes + 1, time.hyphen // 4)
                         dashes, underlines, dots = None, None, None
-                else:
-                    duration = (Fraction(dashes + 1, 1 << underlines)
-                                * (Fraction(2) - Fraction(1, 1 << dots)) * triplet)
                 pitches = pitches.lstrip('[').rstrip(']')
                 pitches = re.findall('({})'.format(pattern_pitch), pitches)
 
                 for k, pitch in enumerate(pitches):
-                    acc, name, octave = parse_pitch(self.key, pitch)
+                    acc, name, octave = parse_pitch(key, pitch)
                     tie = [tie0, tie1]
                     if k > 0:
                         tie[0] = False
@@ -419,79 +417,49 @@ class Song:
                     note = Note(acc, name, octave, duration, dashes, underlines, dots, tie)
                     note_list.append(note)
                     bar_duration += duration
-            assert note_list
 
-            # append to self.melody
+            # append to bars
             if time.upper is None:
                 time_duration = bar_duration
-            elif time.lower == 4:
-                time_duration = Fraction(time.upper)
             else:
-                time_duration = Fraction(time.upper, 2)
-            if i == 0 and len(bars) > 1:        # first bar but not last
-                beat = (time_duration - (bar_duration % time_duration)) % time_duration
+                time_duration = time.duration
+            if i == 0:
+                if start_beat is not None:
+                    beat = start_beat
+                elif len(bar_strs) > 1:         # first bar but not last
+                    beat = (time_duration - (bar_duration % time_duration)) % time_duration
+                else:
+                    beat = Fraction(0)
             else:
                 beat = Fraction(0)
             if beat > 0:
-                self.melody.append((time, beat, []))            # new bar
+                bars.append(Bar(time, beat, []))            # new bar
             for note in note_list:
                 assert note.duration > 0
                 remaining_duration = note.duration
                 first = True
                 while remaining_duration > 0:
                     if beat == 0:
-                        self.melody.append((time, beat, []))    # new bar
+                        bars.append(Bar(time, beat, []))    # new bar
                     sub_duration = min(remaining_duration, time_duration - beat)
-                    if not time.hyphen and sub_duration != remaining_duration:
+                    if auto_split and sub_duration != remaining_duration:
                         raise ValueError('{} goes beyond one bar with time {}/{}'
                                          .format(note, time.upper, time.lower))
+                    # sub_note: note within a bar
                     sub_note = note.copy()
                     sub_note.duration = sub_duration
                     if not first:
                         sub_note.tie[0] = True
-                    self.melody[-1][-1].append(sub_note)
+                    # sub_sub_note: split note
+                    sub_sub_notes = Note.split_note(time, beat, sub_note)
+                    # append
+                    bars[-1].notes.extend(sub_sub_notes)
                     remaining_duration -= sub_duration
                     beat += sub_duration
-                    assert beat <= time_duration
                     if beat == time_duration:
-                        beat = 0
+                        beat = Fraction(0)
                     first = False
-
-    def make_ties_consistent(self):
-        """If note0 and note1 are consecutive, make sure that (note0.tie[1] == note1.tie[0])."""
-        if not self.melody:
-            return
-        prev_tie = False
-        for time, start_beat, notes in self.melody:
-            if not notes:
-                raise ValueError('empty bar in self.melody')
-            for note in notes:
-                if prev_tie:
-                    note.tie[0] = True
-                if note.name == 0:
-                    note.tie = [False, False]
-                prev_tie = note.tie[1]
-        self.melody[0][-1][0].tie[0] = False    # first note
-        self.melody[-1][-1][-1].tie[1] = False  # last note
-
-    def try_split_notes(self):
-        """Try to split note, and modify self.melody in place.
-
-        If note.lines or note.dots is None, splitting is necessary.
-        For these sub-notes, perform a 2nd-staged grouping.
-        """
-        for time, start_beat, notes in self.melody:
-            if not time.hyphen:
-                continue
-            subnotes = []
-            beat = start_beat
-            for note in notes:
-                if note.lines is None or note.dots is None:
-                    subnotes += Note.split_note(time, beat, note)
-                else:
-                    subnotes.append(note)
-                beat += note.duration
-            notes[:] = subnotes
+        return bars
 
     def merge_melody_lyrics(self, _debug=False):
         """Return a list of sections.
@@ -898,7 +866,7 @@ def parse_key(s):
 
 def parse_time(s):
     """Convert time signature string to a pair of integers."""
-    hyphen = None
+    hyphen = 4
     ss = s.split(maxsplit=1)
     if len(ss) > 1:
         hyphen = ss[1].replace(' ', '')
@@ -914,62 +882,92 @@ def parse_time(s):
     if len(ss) != 2:
         raise ValueError('wrong format for <time> {}'.format(s))
     if ss[0] == '?':
-        a, b = None, int(ss[1])
+        upper, lower = None, int(ss[1])
     else:
-        a, b = int(ss[0]), int(ss[1])
-    if (a, b) not in [(2, 4), (3, 4), (4, 4), (6, 8), (9, 8), (12, 8), (None, 4), (None, 8)]:
-        raise ValueError('unrecognizable <time> {}/{}'.format(a, b))
-    if hyphen and hyphen < b:
-        raise ValueError('hyphen must >= {} for <time> {}/{}'.format(b, a, b))
-    return Time(a, b, hyphen)
+        upper, lower = int(ss[0]), int(ss[1])
+    if (upper, lower) not in [(2, 4), (3, 4), (4, 4), (6, 8), (9, 8), (12, 8), (None, 4), (None, 8)]:
+        raise ValueError('unrecognizable <time> {}/{}'.format(upper, lower))
+    if hyphen and hyphen < lower:
+        raise ValueError('hyphen must >= {} for <time> {}/{}'.format(lower, upper, lower))
+    duration = Fraction(upper, lower // 4)
+    return Time(upper, lower, hyphen, duration)
 
 
 def load_song(melody_file, lyrics_file=None):
-    """Load numbered musical notation and lyrics, and return Song."""
-    song = Song()
+    """Load numbered musical notation and lyrics, and return ???."""
+    # read files
+    with open(melody_file, encoding='utf-8') as f:
+        melody_raw_lines = f.readlines()
+    with open(lyrics_file, encoding='utf-8') as f:
+        lyrics_raw_lines = f.readlines()
 
     # melody
-    with open(melody_file) as f:
-        time = None
-        s = ''
-        for line in f:
-            line = line.strip()
-            if line == 'break':
-                break
-            elif not line or line.startswith('//'):     # blank or comment
-                continue
-            elif line.startswith('<key>'):
-                if song.key:
-                    raise ValueError('only one <key> is allowed')
-                song.key = parse_key(line[5:].strip())
-            elif line.startswith('<time>'):
-                if time:
-                    song.append_time_signature(time, s)
-                time = parse_time(line[6:].strip())
-                s = ''
-            else:
-                s += line.replace(' ', '')
-        song.append_time_signature(time, s)
-    song.make_ties_consistent()
-    song.try_split_notes()
+    melody_lines = []
+    key = None
+    time = None
+    beat = None
+    for i, line in enumerate(melody_raw_lines):
+        line = line.strip()
+        if line == 'break':
+            break
+        elif not line or line.startswith('//'):
+            continue
+        elif line.startswith('<key>'):
+            if key:
+                raise ValueError('only one <key> is allowed')
+            key = parse_key(line[5:].strip())
+        elif line.startswith('<time>'):
+            time = parse_time(line[6:].strip())
+            # reset beat
+            beat = None
+        else:
+            if time is None:
+                raise ValueError('no time specified')
+            melody_str = line.replace(' ', '')
+            bars = Song.parse_melody(key, time, beat, melody_str, True)
+            melody_lines.append((i, bars))
+            # update beat
+            last_bar = bars[-1]
+            beat = (last_bar.start_beat + sum(note.duration for note in last_bar.notes)) % last_bar.time.duration
+
+    # make ties consistent
+    prev_tie = False
+    for line_num, bars in melody_lines:
+        for bar in bars:
+            for note in bar.notes:
+                if prev_tie:
+                    note.tie[0] = True
+                if note.name == 0:
+                    note.tie = [False, False]
+                prev_tie = note.tie[1]
 
     # lyrics
-    with open(lyrics_file, encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            s = line
-            for c in ' ,.!?' + '　。，、！？':
-                s = s.replace(c, '')
-            if s == 'break':
-                break
-            elif not s or s.startswith('//'):
-                continue
-            elif s.startswith('<tag>'):
-                tag = s[5:]
-                song.lyrics.append((tag, []))
-            else:
-                if not song.lyrics:
-                    raise ValueError('no <tag> specified before {}'.format(line))
-                song.lyrics[-1][1].append(s)
+    sections = []
+    for line in lyrics_raw_lines:
+        line = line.strip()
+        for c in ' ,.!?' + '　。，、！？':
+            line = line.replace(c, '')
+        if line == 'break':
+            break
+        elif not line or line.startswith('//'):
+            continue
+        elif line.startswith('<section>'):
+            name = line[9:]
+            sections.append(Section(name, []))
+        else:
+            if not sections:
+                raise ValueError('no <section> specified')
+            sections[-1].lines.append(line)
 
-    return song
+    # merge melody and lyrics
+    # TODO
+    # section: (tag, lines)
+    # line: [nodes, list of bars, list of ties, list of slurs]
+    # bar: (time, start_beat, node indices)
+    # tie: (node_idx1, node_idx2)
+
+    # print
+    from pprint import pprint
+    pprint(melody_lines)
+    print(sections)
+    sys.exit()
